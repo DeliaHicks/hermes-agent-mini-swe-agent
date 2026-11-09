@@ -1,0 +1,467 @@
+name: CI
+
+# Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
+# calls the sub-workflows that a PR can actually affect. A final
+# ``all-checks-pass`` gate job aggregates results so branch protection only
+# needs to require a single check.
+#
+# Sub-workflows are triggered via ``workflow_call`` and keep their own job
+# definitions, matrices, and concurrency settings. They no longer have
+# ``push:`` / ``pull_request:`` triggers of their own — everything flows
+# through this file.
+#
+# SECURITY: this workflow runs PR-controlled actions, workflows, and code.
+# Do not add ``secrets: inherit`` or GitHub App credentials here. Trusted
+# main-only automation uses protected environments in its own workflows.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write # needed by lint (PR comment) + supply-chain review_status
+  actions: read # needed by osv-scanner (SARIF upload)
+  security-events: write # needed by osv-scanner (SARIF upload)
+  packages: write # needed by docker build
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+
+jobs:
+  detect:
+    name: Detect affected areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      python: ${{ steps.classify.outputs.python }}
+      frontend: ${{ steps.classify.outputs.frontend }}
+      docker_meta: ${{ steps.classify.outputs.docker_meta }}
+      site: ${{ steps.classify.outputs.site }}
+      scan: ${{ steps.classify.outputs.scan }}
+      deps: ${{ steps.classify.outputs.deps }}
+      npm_lock: ${{ steps.classify.outputs.npm_lock }}
+      mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
+      ci_review: ${{ steps.classify.outputs.ci_review }}
+      ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
+      event_name: ${{ github.event_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Classify changed files
+        id: classify
+        uses: ./.github/actions/detect-changes
+        with:
+          github-token: ${{ github.token }}
+
+  tests:
+    name: Python tests
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/tests.yml
+    with:
+      slice_count: 8
+
+  lint:
+    name: Python lint
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/lint.yml
+    with:
+      event_name: ${{ needs.detect.outputs.event_name }}
+
+  js-tests:
+    name: JS/TS checks
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.frontend == 'true'
+    uses: ./.github/workflows/js-tests.yml
+
+  e2e-desktop:
+    name: Desktop E2E
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      (needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true')
+    uses: ./.github/workflows/e2e-desktop.yml
+
+  docs-site:
+    name: Docs site
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.site == 'true'
+    uses: ./.github/workflows/docs-site-checks.yml
+
+  history-check:
+    name: History check
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.event_name == 'pull_request'
+    uses: ./.github/workflows/history-check.yml
+
+  contributor-check:
+    name: Contributor attribution
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/contributor-check.yml
+
+  uv-lockfile:
+    name: uv.lock check
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success'
+    uses: ./.github/workflows/uv-lockfile-check.yml
+
+  infographic-check:
+    name: Infographic check
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success'
+    uses: ./.github/workflows/infographic-check.yml
+
+  lockfile-diff:
+    name: package-lock semantic diff
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.event_name == 'pull_request' &&
+      needs.detect.outputs.npm_lock == 'true'
+    uses: ./.github/workflows/lockfile-diff.yml
+
+  docker-lint:
+    name: Docker lint
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.docker_meta == 'true'
+    uses: ./.github/workflows/docker-lint.yml
+
+  docker:
+    name: Docker build and test
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.event_name == 'pull_request' &&
+      (needs.detect.outputs.python == 'true' || needs.detect.outputs.frontend == 'true' || needs.detect.outputs.docker_meta == 'true')
+    uses: ./.github/workflows/docker.yml
+
+  supply-chain:
+    name: Supply chain audit
+    needs: detect
+    if: >-
+      always() &&
+      needs.detect.result == 'success' &&
+      needs.detect.outputs.event_name == 'pull_request' &&
+      (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')
+    uses: ./.github/workflows/supply-chain-audit.yml
+    with:
+      event_name: ${{ needs.detect.outputs.event_name }}
+      scan: ${{ needs.detect.outputs.scan == 'true' }}
+      deps: ${{ needs.detect.outputs.deps == 'true' }}
+
+  review-labels:
+    name: Review label gate
+    needs:
+      - detect
+      - supply-chain
+    if: >-
+      always() &&
+      needs.detect.outputs.event_name == 'pull_request' &&
+      (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
+    uses: ./.github/workflows/review-labels.yml
+    with:
+      ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
+      ci_review_files: ${{ needs.detect.outputs.ci_review_files }}
+      mcp_catalog: ${{ needs.detect.outputs.mcp_catalog == 'true' }}
+      supply_chain: ${{ needs.supply-chain.outputs.critical_findings == 'true' }}
+
+  osv-scanner:
+    name: OSV scan
+    uses: ./.github/workflows/osv-scanner.yml
+
+  comment-live:
+    name: CI review comment (live)
+    needs:
+      - detect
+      - review-labels
+      - lockfile-diff
+      - supply-chain
+      - osv-scanner
+      - uv-lockfile
+      - history-check
+      - contributor-check
+      - e2e-desktop
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout default-branch review tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Collect review statuses from called workflows
+        env:
+          REVIEW_STATUS_REVIEW_LABELS: ${{ needs.review-labels.outputs.review_status }}
+          REVIEW_STATUS_LOCKFILE_DIFF: ${{ needs.lockfile-diff.outputs.review_status }}
+          REVIEW_STATUS_SUPPLY_CHAIN: ${{ needs.supply-chain.outputs.review_status }}
+          REVIEW_STATUS_UV_LOCKFILE: ${{ needs.uv-lockfile.outputs.review_status }}
+          REVIEW_STATUS_HISTORY_CHECK: ${{ needs.history-check.outputs.review_status }}
+          REVIEW_STATUS_CONTRIBUTOR_CHECK: ${{ needs.contributor-check.outputs.review_status }}
+          REVIEW_STATUS_E2E_DESKTOP: ${{ needs.e2e-desktop.outputs.review_status }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          sources = (
+              "REVIEW_STATUS_REVIEW_LABELS",
+              "REVIEW_STATUS_LOCKFILE_DIFF",
+              "REVIEW_STATUS_SUPPLY_CHAIN",
+              "REVIEW_STATUS_UV_LOCKFILE",
+              "REVIEW_STATUS_HISTORY_CHECK",
+              "REVIEW_STATUS_CONTRIBUTOR_CHECK",
+              "REVIEW_STATUS_E2E_DESKTOP",
+          )
+          merged = []
+          for source in sources:
+              raw = os.environ.get(source, "").strip()
+              if not raw:
+                  continue
+              try:
+                  parsed = json.loads(raw)
+              except json.JSONDecodeError:
+                  continue
+              if isinstance(parsed, list):
+                  merged.extend(parsed)
+          with open("/tmp/review-statuses.json", "w", encoding="utf-8") as output:
+              json.dump(merged, output)
+          print(f"Merged {len(merged)} review status entries.")
+          PY
+
+      - name: Poll and update unified review comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          FALLBACK_COMMIT_MESSAGE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          COMMIT_MESSAGE="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${COMMIT_SHA}" --jq '.commit.message' 2>/dev/null || true)"
+          if [ -z "$COMMIT_MESSAGE" ]; then
+            COMMIT_MESSAGE="$FALLBACK_COMMIT_MESSAGE"
+          fi
+          COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA}"
+          export COMMIT_MESSAGE COMMIT_URL
+          python3 scripts/ci/live_comment.py --review-statuses-file /tmp/review-statuses.json
+
+  all-checks-pass:
+    name: All required checks pass
+    needs:
+      - detect
+      - tests
+      - lint
+      - js-tests
+      - e2e-desktop
+      - docs-site
+      - history-check
+      - contributor-check
+      - uv-lockfile
+      - lockfile-diff
+      - docker-lint
+      - supply-chain
+      - review-labels
+      - osv-scanner
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summarize required check results
+        env:
+          RESULT_DETECT: ${{ needs.detect.result }}
+          RESULT_TESTS: ${{ needs.tests.result }}
+          RESULT_LINT: ${{ needs.lint.result }}
+          RESULT_JS_TESTS: ${{ needs.js-tests.result }}
+          RESULT_E2E_DESKTOP: ${{ needs.e2e-desktop.result }}
+          RESULT_DOCS_SITE: ${{ needs.docs-site.result }}
+          RESULT_HISTORY_CHECK: ${{ needs.history-check.result }}
+          RESULT_CONTRIBUTOR_CHECK: ${{ needs.contributor-check.result }}
+          RESULT_UV_LOCKFILE: ${{ needs.uv-lockfile.result }}
+          RESULT_LOCKFILE_DIFF: ${{ needs.lockfile-diff.result }}
+          RESULT_DOCKER_LINT: ${{ needs.docker-lint.result }}
+          RESULT_SUPPLY_CHAIN: ${{ needs.supply-chain.result }}
+          RESULT_REVIEW_LABELS: ${{ needs.review-labels.result }}
+          RESULT_OSV_SCANNER: ${{ needs.osv-scanner.result }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          mapping = {
+              "detect": "RESULT_DETECT",
+              "tests": "RESULT_TESTS",
+              "lint": "RESULT_LINT",
+              "js-tests": "RESULT_JS_TESTS",
+              "e2e-desktop": "RESULT_E2E_DESKTOP",
+              "docs-site": "RESULT_DOCS_SITE",
+              "history-check": "RESULT_HISTORY_CHECK",
+              "contributor-check": "RESULT_CONTRIBUTOR_CHECK",
+              "uv-lockfile": "RESULT_UV_LOCKFILE",
+              "lockfile-diff": "RESULT_LOCKFILE_DIFF",
+              "docker-lint": "RESULT_DOCKER_LINT",
+              "supply-chain": "RESULT_SUPPLY_CHAIN",
+              "review-labels": "RESULT_REVIEW_LABELS",
+              "osv-scanner": "RESULT_OSV_SCANNER",
+          }
+          results = {job: os.environ[env] for job, env in mapping.items()}
+          compact = json.dumps(results, separators=(",", ":"))
+          print(compact)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Required check results\n\n```json\n")
+              summary.write(compact)
+              summary.write("\n```\n")
+          failed = [job for job, result in results.items() if result == "failure"]
+          if failed:
+              print("::error::Required checks failed: " + ", ".join(failed))
+              raise SystemExit(1)
+          PY
+
+  ci-timings:
+    name: CI timings
+    needs:
+      - all-checks-pass
+      - docker
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout default-branch report tools
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Restore main timing baseline
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ci-timings-baseline.json
+          key: ci-timings-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ci-timings-baseline-
+
+      - name: Generate timing report
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/timings_report.py \
+            --baseline ci-timings-baseline.json \
+            --output ci-timings-report.html \
+            --json-out ci-timings.json \
+            --summary-out ci-timings-summary.md
+
+      - name: Upload HTML timing report
+        id: upload-report
+        if: always() && hashFiles('ci-timings-report.html') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-timings-report
+          path: ci-timings-report.html
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: ignore
+
+      - name: Generate timing review status
+        if: always() && hashFiles('ci-timings.json') != ''
+        env:
+          CI_TIMINGS_REPORT_URL: ${{ steps.upload-report.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/timings_report.py \
+            --from-json ci-timings.json \
+            --baseline ci-timings-baseline.json \
+            --review-status-only \
+            --review-status-out review-status.json
+
+      - name: Upload timing review status
+        if: always() && hashFiles('review-status.json') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-timings-review-status
+          path: review-status.json
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: ignore
+
+      - name: Prepare main timing baseline
+        if: >-
+          always() &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          hashFiles('ci-timings.json') != ''
+        run: cp ci-timings.json ci-timings-baseline.json
+
+      - name: Save main timing baseline
+        if: >-
+          always() &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          hashFiles('ci-timings-baseline.json') != ''
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ci-timings-baseline.json
+          key: ci-timings-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Write timing summary
+        if: always()
+        env:
+          REPORT_URL: ${{ steps.upload-report.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## CI timing report"
+            echo ""
+            if [ -n "${REPORT_URL:-}" ]; then
+              echo "Full HTML report: [download artifact](${REPORT_URL})"
+            else
+              echo "Full HTML report: upload unavailable."
+            fi
+            echo ""
+            cat ci-timings-summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
