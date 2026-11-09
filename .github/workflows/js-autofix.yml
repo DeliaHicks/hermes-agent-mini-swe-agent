@@ -1,0 +1,417 @@
+name: auto-fix lint issues & formatting
+
+# On push to main (or manual trigger), run `npm run fix` on each workspace
+# package and apply any changes via a PR.
+#
+# Fixable lint issues (import sorting, unused imports, curly braces, etc.) are
+# auto-corrected on merge so PRs aren't blocked by them. The PR-time eslint
+# check in typecheck.yml fails only when un-fixable errors remain.
+#
+# NOTE: App token pushes DO trigger further workflow runs (unlike
+# secrets.GITHUB_TOKEN). The concurrency group (ts-autofix-${{ github.ref }})
+# with cancel-in-progress: true prevents an infinite loop — a re-triggered
+# run cancels the in-flight one, and since the second run finds no new fixes
+# (the first run already applied them), it exits with an empty patch.
+#
+# ── Security model: two-job split ───────────────────────────────────────────
+#
+# The eslint process executes repo code (eslint.config.mjs, package.json
+# scripts, installed plugins). To prevent a malicious PR from getting arbitrary
+# code execution on a runner with push access, the work is split:
+#
+#   1. generate-patch (unprivileged, contents: read only)
+#      Checks out, installs deps, runs eslint --fix, produces a .patch artifact.
+#      Worst case: malicious code runs here on an ephemeral runner with zero
+#      push permissions.
+#
+#   2. apply-patch (privileged, contents: write + pull-requests: write)
+#      Checks out, downloads the patch artifact, applies it, pushes to the
+#      bot/js-autofix branch, creates/updates a PR, and enables auto-merge.
+#      This job never runs npm, never installs anything, never executes any
+#      repo code. The only input it trusts is the patch artifact.
+#      Skipped entirely when generate-patch reports no fixes (has-fixes != true).
+#      The PR auto-merges (squash) once CI passes. If CI fails or main moves,
+#      the PR is auto-closed and the branch deleted — the next run re-applies
+#      on the current state.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.js'
+      - '**/*.cjs'
+      - '**/*.mjs'
+      - '**/*.ts'
+      - '**/*.tsx'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read # default; apply-patch job overrides to write
+
+concurrency:
+  group: ts-autofix-${{ github.ref }}
+  cancel-in-progress: true
+
+
+jobs:
+  generate-patch:
+    name: Generate lint and formatting patch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has-fixes: ${{ steps.patch.outputs.has-fixes }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install npm dependencies from lockfile
+        uses: ./.github/actions/retry
+        with:
+          command: npm ci --ignore-scripts
+          attempts: '3'
+          delay: '10'
+
+      - name: Run workspace autofix task
+        id: fix
+        continue-on-error: true
+        run: npm run fix
+
+      - name: Generate and validate patch
+        id: patch
+        shell: bash
+        env:
+          PATCH_PATH: ${{ runner.temp }}/js-autofix/js-autofix.patch
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$PATCH_PATH")"
+
+          if git diff --quiet --; then
+            : > "$PATCH_PATH"
+            echo "has-fixes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has-fixes=true" >> "$GITHUB_OUTPUT"
+          git diff --no-ext-diff --binary -- > "$PATCH_PATH"
+
+          invalid=()
+          while IFS= read -r -d '' file; do
+            case "$file" in
+              *.js|*.cjs|*.mjs|*.ts|*.tsx|*.json) ;;
+              *) invalid+=("$file") ;;
+            esac
+          done < <(git diff --no-ext-diff --name-only -z --)
+
+          if [ "${#invalid[@]}" -ne 0 ]; then
+            printf '::error::Autofix changed unsupported file type(s): %s\n' "${invalid[*]}"
+            exit 1
+          fi
+
+      - name: Upload patch artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: js-autofix-patch
+          path: ${{ runner.temp }}/js-autofix/js-autofix.patch
+          if-no-files-found: error
+
+  apply-patch:
+    name: Apply patch and manage pull request
+    needs: generate-patch
+    if: ${{ needs.generate-patch.result == 'success' && needs.generate-patch.outputs.has-fixes == 'true' }}
+    runs-on: ubuntu-latest
+    environment: trusted-automation
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Get GitHub App token
+        id: app_token
+        uses: ./.github/actions/get-app-token
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Download generated patch
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: js-autofix-patch
+          path: ${{ runner.temp }}/js-autofix
+
+      - name: Apply patch and push autofix branch
+        shell: bash
+        env:
+          PATCH_PATH: ${{ runner.temp }}/js-autofix/js-autofix.patch
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$PATCH_PATH" ]; then
+            echo "::error::Patch artifact is missing"
+            exit 1
+          fi
+
+          if [ ! -s "$PATCH_PATH" ]; then
+            echo "Patch is empty; skipping commit and push."
+            exit 0
+          fi
+
+          git apply --check "$PATCH_PATH"
+          git apply "$PATCH_PATH"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git checkout -B bot/js-autofix
+          git add -u
+          git commit -m 'chore: apply automated lint and formatting fixes'
+          git push --force origin bot/js-autofix
+
+      - name: Create or reuse pull request
+        id: manage_pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ steps.app_token.outputs.token }}
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const branch = 'bot/js-autofix'
+            const base = context.payload.repository.default_branch
+
+            let pull
+            try {
+              const { data: pulls } = await github.rest.pulls.list({
+                owner,
+                repo,
+                state: 'open',
+                head: `${owner}:${branch}`,
+                base,
+                per_page: 100
+              })
+              pull = pulls[0]
+            } catch (error) {
+              core.info(`Could not list open pull requests; attempting to create one: ${error.message}`)
+            }
+
+            if (!pull) {
+              const { data: created } = await github.rest.pulls.create({
+                owner,
+                repo,
+                title: 'chore: auto-fix lint issues & formatting',
+                head: branch,
+                base,
+                body: 'Automated lint and formatting fixes generated by the js-autofix workflow.'
+              })
+              pull = created
+            }
+
+            core.setOutput('pr-number', String(pull.number))
+
+            try {
+              await github.graphql(
+                `mutation($pullRequestId: ID!) {
+                  enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: SQUASH}) {
+                    pullRequest { number }
+                  }
+                }`,
+                { pullRequestId: pull.node_id }
+              )
+              core.info(`Enabled squash auto-merge for pull request #${pull.number}`)
+            } catch (error) {
+              core.warning(`Could not enable auto-merge for pull request #${pull.number}: ${error.message}`)
+            }
+
+      - name: Poll pull request and clean up stale or failed runs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ steps.manage_pr.outputs.pr-number }}
+        with:
+          github-token: ${{ steps.app_token.outputs.token }}
+          script: |
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+            const branch = 'bot/js-autofix'
+            const base = context.payload.repository.default_branch
+            let activePrNumber = Number(process.env.PR_NUMBER)
+
+            if (!Number.isInteger(activePrNumber) || activePrNumber <= 0) {
+              throw new Error(`Invalid pull request number: ${process.env.PR_NUMBER}`)
+            }
+
+            const maxPolls = 20
+            const pollIntervalMs = 30000
+            const failureConclusions = new Set(['failure', 'timed_out', 'startup_failure'])
+
+            async function wait(ms) {
+              await new Promise(resolve => setTimeout(resolve, ms))
+            }
+
+            async function getPull(pullNumber) {
+              try {
+                return (await github.rest.pulls.get({ owner, repo, pull_number: pullNumber })).data
+              } catch (error) {
+                if (error.status === 404) {
+                  return null
+                }
+                throw error
+              }
+            }
+
+            async function closePullAndDeleteBranch(pullNumber, ignoreErrors) {
+              const errors = []
+
+              try {
+                await github.rest.pulls.update({ owner, repo, pull_number: pullNumber, state: 'closed' })
+              } catch (error) {
+                errors.push(`close pull request: ${error.message}`)
+              }
+
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `heads/${branch}` })
+              } catch (error) {
+                errors.push(`delete branch: ${error.message}`)
+              }
+
+              if (errors.length === 0) {
+                return
+              }
+
+              if (ignoreErrors) {
+                for (const error of errors) {
+                  core.warning(`Cleanup failed (ignored): ${error}`)
+                }
+                return
+              }
+
+              throw new Error(`Cleanup failed: ${errors.join('; ')}`)
+            }
+
+            for (let attempt = 1; attempt <= maxPolls; attempt += 1) {
+              core.info(`Polling pull request #${activePrNumber} (attempt ${attempt}/${maxPolls})`)
+
+              let openPullRequests
+              try {
+                const { data } = await github.rest.pulls.list({
+                  owner,
+                  repo,
+                  state: 'open',
+                  head: `${owner}:${branch}`,
+                  base,
+                  per_page: 100
+                })
+                openPullRequests = data
+              } catch (error) {
+                core.warning(`Could not list open pull requests; treating as none: ${error.message}`)
+                return
+              }
+
+              const openPull = openPullRequests.find(pull => pull.number === activePrNumber) || openPullRequests[0]
+              if (!openPull) {
+                core.info('No open pull request remains; finishing successfully.')
+                return
+              }
+              activePrNumber = openPull.number
+
+              let pull
+              try {
+                pull = await getPull(activePrNumber)
+              } catch (error) {
+                throw new Error(`Could not query pull request state: ${error.message}`)
+              }
+              if (!pull) {
+                core.info('Pull request no longer exists; finishing successfully.')
+                return
+              }
+              if (pull.state !== 'open' || pull.merged_at) {
+                core.info(`Pull request is ${pull.merged_at ? 'merged' : pull.state}; finishing successfully.`)
+                return
+              }
+
+              let baseSha
+              try {
+                baseSha = (await github.rest.git.getRef({ owner, repo, ref: `heads/${base}` })).data.object.sha
+              } catch (error) {
+                throw new Error(`Could not query base branch state: ${error.message}`)
+              }
+
+              if (baseSha !== context.sha) {
+                let latest
+                try {
+                  latest = await getPull(activePrNumber)
+                } catch (error) {
+                  throw new Error(`Could not re-confirm pull request state: ${error.message}`)
+                }
+
+                if (!latest) {
+                  core.info('Pull request no longer exists; finishing successfully.')
+                  return
+                }
+                if (latest.merged_at) {
+                  core.info('Pull request was merged after the base branch moved; finishing successfully.')
+                  return
+                }
+
+                core.info('Pull request is stale because the base branch moved; closing it and deleting the autofix branch.')
+                await closePullAndDeleteBranch(activePrNumber, true)
+                return
+              }
+
+              let checkRuns = null
+              try {
+                const { data } = await github.rest.checks.listForRef({
+                  owner,
+                  repo,
+                  ref: pull.head.sha,
+                  filter: 'latest',
+                  per_page: 100
+                })
+                checkRuns = data.check_runs || []
+              } catch (error) {
+                core.warning(`Could not query CI checks; skipping failure cleanup: ${error.message}`)
+              }
+
+              if (checkRuns !== null) {
+                const failed = checkRuns.filter(check => failureConclusions.has(check.conclusion))
+                if (failed.length > 0) {
+                  const names = failed.map(check => check.name).join(', ')
+                  core.info(`CI checks failed (${names}); closing the pull request and deleting the autofix branch.`)
+                  await closePullAndDeleteBranch(activePrNumber, false)
+                  return
+                }
+              }
+
+              let mergeState
+              try {
+                mergeState = await getPull(activePrNumber)
+              } catch (error) {
+                throw new Error(`Could not query merge conflicts: ${error.message}`)
+              }
+              if (!mergeState) {
+                core.info('Pull request no longer exists; finishing successfully.')
+                return
+              }
+              if (mergeState.mergeable === false || mergeState.mergeable_state === 'dirty') {
+                core.info('Pull request has merge conflicts; closing it and deleting the autofix branch.')
+                await closePullAndDeleteBranch(activePrNumber, false)
+                return
+              }
+
+              if (attempt < maxPolls) {
+                await wait(pollIntervalMs)
+              }
+            }
+
+            core.info(`Polling finished after ${maxPolls} attempts; leaving the pull request open.`)
